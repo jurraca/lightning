@@ -693,7 +693,7 @@ static bool new_missed_channel_account(struct command *cmd,
 
 		chain_ev->credit = amt;
 		db_begin_transaction(db);
-		if (!log_chain_event(db, acct, chain_ev))
+		if (!log_chain_event(chain_ev, db, acct, chain_ev))
 			goto done;
 
 		maybe_update_account(db, acct, chain_ev,
@@ -1498,7 +1498,7 @@ parse_and_log_chain_move(struct command *cmd,
 		orig_acct = NULL;
 
 
-	if (!log_chain_event(db, acct, e)) {
+	if (!log_chain_event(e, db, acct, e)) {
 		db_commit_transaction(db);
 		/* This is not a new event, do nothing */
 		return notification_handled(cmd);
@@ -1530,7 +1530,8 @@ parse_and_log_chain_move(struct command *cmd,
 		/* Go see if there's any deposits to an external
 		 * that are now confirmed */
 		/* FIXME: might need updating when we can splice? */
-		maybe_closeout_external_deposits(db, e);
+		maybe_closeout_external_deposits(db, e->spending_txid,
+						 e->blockheight);
 		db_commit_transaction(db);
 	}
 
@@ -1685,6 +1686,173 @@ static char *parse_tags(const tal_t *ctx,
 	return NULL;
 }
 
+static struct command_result *json_utxo_deposit(struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *move_tag ="utxo_deposit";
+	struct chain_event ev;
+	struct account *acct;
+	const char *err;
+
+	err = json_scan(tmpctx, buf, params,
+			"{payload:{utxo_deposit:{"
+			"account:%"
+			",transfer_from:%"
+			",outpoint:%"
+			",amount_msat:%"
+			",coin_type:%"
+			",timestamp:%"
+			",blockheight:%"
+			"}}}",
+			JSON_SCAN_TAL(tmpctx, json_strdup, &ev.acct_name),
+			JSON_SCAN_TAL(tmpctx, json_strdup, &ev.origin_acct),
+			JSON_SCAN(json_to_outpoint, &ev.outpoint),
+			JSON_SCAN(json_to_msat, &ev.credit),
+			JSON_SCAN_TAL(tmpctx, json_strdup, &ev.currency),
+			JSON_SCAN(json_to_u64, &ev.timestamp),
+			JSON_SCAN(json_to_u32, &ev.blockheight));
+
+	if (err)
+		plugin_err(cmd->plugin,
+			   "`%s` payload did not scan %s: %.*s",
+			   move_tag, err, json_tok_full_len(params),
+			   json_tok_full(buf, params));
+
+	/* Log the thing */
+	db_begin_transaction(db);
+	acct = find_account(tmpctx, db, ev.acct_name);
+
+	if (!acct) {
+		acct = new_account(tmpctx, ev.acct_name, NULL);
+		account_add(db, acct);
+	}
+
+	ev.tag = "deposit";
+	ev.ignored = false;
+	ev.stealable = false;
+	ev.rebalance = false;
+	ev.debit = AMOUNT_MSAT(0);
+	ev.output_value = ev.credit;
+	ev.spending_txid = NULL;
+	ev.payment_id = NULL;
+	ev.desc = NULL;
+
+	plugin_log(cmd->plugin, LOG_DBG, "%s (%s|%s) %s -%s %"PRIu64" %d %s",
+		   move_tag, ev.tag, ev.acct_name,
+		   type_to_string(tmpctx, struct amount_msat, &ev.credit),
+		   type_to_string(tmpctx, struct amount_msat, &ev.debit),
+		   ev.timestamp, ev.blockheight,
+		   type_to_string(tmpctx, struct bitcoin_outpoint, &ev.outpoint));
+
+	if (!log_chain_event(cmd, db, acct, &ev)) {
+		db_commit_transaction(db);
+		/* This is not a new event, do nothing */
+		return notification_handled(cmd);
+	}
+
+	/* Can we calculate any onchain fees now? */
+	err = maybe_update_onchain_fees(cmd, db, &ev.outpoint.txid);
+	db_commit_transaction(db);
+	if (err)
+		plugin_err(cmd->plugin,
+			   "Unable to update onchain fees %s",
+			   err);
+
+	/* FIXME: do account close checks, when allow onchain close to externals? */
+	return notification_handled(cmd);;
+}
+
+static struct command_result *json_utxo_spent(struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *move_tag ="utxo_spent";
+	struct account *acct;
+	struct chain_event ev;
+	const char *err, *acct_name;
+
+	ev.spending_txid = tal(cmd, struct bitcoin_txid);
+	err = json_scan(tmpctx, buf, params,
+			"{payload:{utxo_spent:{"
+			"account:%"
+			",outpoint:%"
+			",spending_txid:%"
+			",amount_msat:%"
+			",coin_type:%"
+			",timestamp:%"
+			",blockheight:%"
+			"}}}",
+			JSON_SCAN_TAL(tmpctx, json_strdup, &acct_name),
+			JSON_SCAN(json_to_outpoint, &ev.outpoint),
+			JSON_SCAN(json_to_txid, ev.spending_txid),
+			JSON_SCAN(json_to_msat, &ev.debit),
+			JSON_SCAN_TAL(tmpctx, json_strdup, &ev.currency),
+			JSON_SCAN(json_to_u64, &ev.timestamp),
+			JSON_SCAN(json_to_u32, &ev.blockheight));
+
+	if (err)
+		plugin_err(cmd->plugin,
+			   "`%s` payload did not scan %s: %.*s",
+			   move_tag, err, json_tok_full_len(params),
+			   json_tok_full(buf, params));
+
+	/* Log the thing */
+	db_begin_transaction(db);
+	acct = find_account(tmpctx, db, acct_name);
+
+	if (!acct) {
+		acct = new_account(tmpctx, acct_name, NULL);
+		account_add(db, acct);
+	}
+
+	ev.origin_acct = NULL;
+	ev.tag = "withdrawal";
+	ev.ignored = false;
+	ev.stealable = false;
+	ev.rebalance = false;
+	ev.credit = AMOUNT_MSAT(0);
+	ev.output_value = ev.debit;
+	ev.payment_id = NULL;
+	ev.desc = NULL;
+
+	plugin_log(cmd->plugin, LOG_DBG, "%s (%s|%s) %s -%s %"PRIu64" %d %s %s",
+		   move_tag, ev.tag, acct_name,
+		   type_to_string(tmpctx, struct amount_msat, &ev.credit),
+		   type_to_string(tmpctx, struct amount_msat, &ev.debit),
+		   ev.timestamp, ev.blockheight,
+		   type_to_string(tmpctx, struct bitcoin_outpoint, &ev.outpoint),
+		   type_to_string(tmpctx, struct bitcoin_txid, ev.spending_txid));
+
+	if (!log_chain_event(cmd, db, acct, &ev)) {
+		db_commit_transaction(db);
+		/* This is not a new event, do nothing */
+		return notification_handled(cmd);
+	}
+
+	err = maybe_update_onchain_fees(cmd, db, ev.spending_txid);
+	if (err) {
+		db_commit_transaction(db);
+		plugin_err(cmd->plugin,
+			   "Unable to update onchain fees %s",
+			   err);
+	}
+
+	err = maybe_update_onchain_fees(cmd, db, &ev.outpoint.txid);
+	if (err) {
+		db_commit_transaction(db);
+		plugin_err(cmd->plugin,
+			   "Unable to update onchain fees %s",
+			   err);
+	}
+
+	/* Go see if there's any deposits to an external
+	 * that are now confirmed */
+	/* FIXME: might need updating when we can splice? */
+	maybe_closeout_external_deposits(db, ev.spending_txid,
+					 ev.blockheight);
+	db_commit_transaction(db);
+
+	/* FIXME: do account close checks, when allow onchain close to externals? */
+	return notification_handled(cmd);;
+}
+
 static struct command_result *json_coin_moved(struct command *cmd,
 					      const char *buf,
 					      const jsmntok_t *params)
@@ -1760,7 +1928,15 @@ const struct plugin_notification notifs[] = {
 	{
 		"balance_snapshot",
 		json_balance_snapshot,
-	}
+	},
+	{
+		"utxo_deposit",
+		json_utxo_deposit,
+	},
+	{
+		"utxo_spent",
+		json_utxo_spent,
+	},
 };
 
 static const struct plugin_command commands[] = {
